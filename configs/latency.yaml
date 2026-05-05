@@ -21,6 +21,13 @@ ranks: [4, 8, 16, 32, 64]
 iters: 50
 warmup: 10
 
+# Cached-verification timing: k draft tokens on a KV cache of length L. This
+# is the denominator that actually matters for spec-decode throughput — full
+# prefill (above) is a generous upper bound.
+verification:
+  prefix_lens: [1024, 2048, 4096]
+  draft_ks: [4, 8, 16, 32]
+
 output:
   root: runs/r2
 
@@ -33,3 +40,6 @@ kill_criterion:
   vocab_target: 152064
   seq_len_target: 2048
   ratio_threshold: 0.3
+  # Cached-verification reference cell (reported, not hard-gated).
+  cached_prefix_target: 2048
+  cached_k_target: 16

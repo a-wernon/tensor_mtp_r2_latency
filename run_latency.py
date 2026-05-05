@@ -25,7 +25,7 @@ import torch
 from loguru import logger
 
 from r2lat.cp import FFSampler, SharedTrunkCPSampler
-from r2lat.target import load_target, time_target
+from r2lat.target import load_target, time_target, time_target_cached
 from r2lat.utils import (
     configure_logger,
     cuda_time_ms,
@@ -108,6 +108,8 @@ def _apply_smoke(cfg: dict) -> None:
     cfg["seq_lens"] = [1024]
     cfg["iters"] = 20
     cfg["warmup"] = 5
+    if "verification" in cfg:
+        cfg["verification"] = {"prefix_lens": [1024], "draft_ks": [16]}
     cfg["run_name"] = cfg["run_name"] + "_smoke"
 
 
@@ -138,6 +140,7 @@ def main() -> None:
 
     # ---- target forward pass -------------------------------------------------
     target_results: dict[int, dict] = {}
+    target_cached_results: dict[str, dict[str, dict]] = {}
     if args.skip_target:
         H = int(cfg["hidden_size_override"])
         logger.warning(
@@ -154,6 +157,15 @@ def main() -> None:
             warmup=cfg["warmup"],
             device=device,
         )
+        if "verification" in cfg and cfg["verification"]:
+            target_cached_results = time_target_cached(
+                target,
+                prefix_lens=cfg["verification"]["prefix_lens"],
+                draft_ks=cfg["verification"]["draft_ks"],
+                iters=cfg["iters"],
+                warmup=cfg["warmup"],
+                device=device,
+            )
         del target
         torch.cuda.empty_cache()
 
@@ -225,17 +237,33 @@ def main() -> None:
         ratio = None
         decision = "UNAVAILABLE"
 
-    # Also report ratios across the full grid for each seq_len.
+    # Cached-verification reference ratio (reported, not a hard gate).
+    cached_L = str(kill.get("cached_prefix_target", 2048))
+    cached_k = str(kill.get("cached_k_target", 16))
+    cached_tgt_stat = target_cached_results.get(cached_L, {}).get(cached_k)
+    cached_ratio = (
+        cp_row["median_ms"] / cached_tgt_stat["median_ms"]
+        if cp_row is not None and cached_tgt_stat is not None
+        else None
+    )
+
+    # Full-grid ratios for every (V, n, r) against every prefill L + the
+    # reference cached cell.
     ratio_grid: list[dict] = []
     for row in cp_rows:
         entry = {"V": row["V"], "n": row["n"], "r": row["r"], "cp_ms": row["median_ms"]}
         for L, s in target_results.items():
             entry[f"ratio_L{L}"] = row["median_ms"] / s["median_ms"]
+        if cached_tgt_stat is not None:
+            entry[f"ratio_cached_L{cached_L}_k{cached_k}"] = (
+                row["median_ms"] / cached_tgt_stat["median_ms"]
+            )
         ratio_grid.append(entry)
 
     summary = {
         "hidden_size": H,
         "target": {str(L): s for L, s in target_results.items()},
+        "target_cached": target_cached_results,
         "ff": ff_rows,
         "cp": cp_rows,
         "ratio_grid": ratio_grid,
@@ -246,28 +274,50 @@ def main() -> None:
             "target_ms": tgt_stat["median_ms"] if tgt_stat else None,
             "ratio": ratio,
             "decision": decision,
+            "cached": {
+                "prefix_len": int(cached_L),
+                "k": int(cached_k),
+                "target_cached_ms": (
+                    cached_tgt_stat["median_ms"] if cached_tgt_stat else None
+                ),
+                "ratio": cached_ratio,
+            },
         },
     }
     dump_json(run_dir / "summary.json", summary)
-    logger.info(json.dumps(summary["kill_criterion"], indent=2))
+    logger.info(json.dumps(summary["kill_criterion"], indent=2, default=str))
 
     # ---- plots ---------------------------------------------------------------
     _plot_cp_vs_rank(cp_rows, run_dir)
     if target_results:
         _plot_ratio_grid(cp_rows, target_results, run_dir, kill["ratio_threshold"])
+    if target_cached_results:
+        _plot_cached_ratio(
+            cp_rows,
+            target_cached_results,
+            run_dir,
+            reference_L=int(cached_L),
+            reference_k=int(cached_k),
+        )
 
-    print("\n" + "=" * 64)
+    print("\n" + "=" * 72)
     if ratio is not None:
         print(
             f"DECISION: {decision}   "
-            f"(CP {cp_row['median_ms']:.2f}ms / target {tgt_stat['median_ms']:.2f}ms "
+            f"(CP {cp_row['median_ms']:.2f}ms / target-prefill {tgt_stat['median_ms']:.2f}ms "
             f"= {ratio:.3f}  @ V={kill['vocab_target']},n={kill['block_size_target']},"
             f"r={kill['rank_target']},L={kill['seq_len_target']};  thr={kill['ratio_threshold']})"
         )
     else:
         print(f"DECISION: {decision}  (target timings unavailable)")
+    if cached_ratio is not None:
+        print(
+            f"          cached-verification: CP {cp_row['median_ms']:.2f}ms / "
+            f"target-verify(L={cached_L},k={cached_k}) {cached_tgt_stat['median_ms']:.2f}ms "
+            f"= {cached_ratio:.3f}   (reported, not gated)"
+        )
     print(f"Outputs: {run_dir}")
-    print("=" * 64)
+    print("=" * 72)
 
 
 def _plot_cp_vs_rank(cp_rows: list[dict], run_dir: Path) -> None:
@@ -343,9 +393,102 @@ def _plot_ratio_grid(
             ax.set_title(f"V={V}, target L={L} ({t_target:.1f}ms)")
             ax.grid(alpha=0.3)
             ax.legend(fontsize=8)
-    fig.suptitle("CP sampling cost as fraction of target forward")
+    fig.suptitle("CP sampling cost as fraction of target forward (prefill)")
     fig.tight_layout()
     fig.savefig(run_dir / "ratio_grid.png", dpi=150)
+    plt.close(fig)
+
+
+def _plot_cached_ratio(
+    cp_rows: list[dict],
+    target_cached_results: dict,
+    run_dir: Path,
+    reference_L: int,
+    reference_k: int,
+) -> None:
+    """Cached-verification ratio plot.
+
+    Top row: t_CP / t_target_cached at the reference (L, k) cell, one
+    subplot per vocab, curves per block size, x-axis = CP rank.
+    Bottom row: same-V, vary k at the reference L — shows how fast
+    the ratio moves as draft length scales.
+    """
+    vocabs = sorted({row["V"] for row in cp_rows})
+    ref = target_cached_results.get(str(reference_L), {}).get(str(reference_k))
+    if not vocabs or ref is None:
+        return
+
+    L_keys = sorted(target_cached_results.keys(), key=lambda s: int(s))
+    ks_at_ref = sorted(
+        target_cached_results.get(str(reference_L), {}).keys(), key=lambda s: int(s)
+    )
+
+    fig, axes = plt.subplots(
+        2, len(vocabs), figsize=(5.0 * len(vocabs), 7.2), squeeze=False
+    )
+
+    # Row 0: ratio vs rank at the reference (L, k).
+    t_ref = ref["median_ms"]
+    for j, V in enumerate(vocabs):
+        ax = axes[0][j]
+        ns = sorted({row["n"] for row in cp_rows if row["V"] == V})
+        for n in ns:
+            rs = sorted({row["r"] for row in cp_rows if row["V"] == V and row["n"] == n})
+            ys = [
+                next(
+                    row["median_ms"]
+                    for row in cp_rows
+                    if row["V"] == V and row["n"] == n and row["r"] == r_
+                )
+                / t_ref
+                for r_ in rs
+            ]
+            ax.plot(rs, ys, marker="o", label=f"n={n}")
+        ax.axhline(0.3, color="red", ls="--", lw=1, label="ref 0.3")
+        ax.axhline(1.0, color="orange", ls=":", lw=1, label="parity (1.0)")
+        ax.set_xscale("log", base=2)
+        ax.set_xlabel("CP rank")
+        ax.set_ylabel(f"t_CP / t_cached(L={reference_L}, k={reference_k})")
+        ax.set_title(f"V={V}  ({t_ref:.2f} ms cached verify)")
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=8)
+
+    # Row 1: sweep k at reference L, with CP fixed at a few representative
+    # cells (n=16 at a couple of ranks) — shows how cached ratio evolves
+    # with draft length at the block size R1 identified.
+    highlight_cells = [(16, 8), (16, 32), (32, 8)]
+    for j, V in enumerate(vocabs):
+        ax = axes[1][j]
+        for (n, r) in highlight_cells:
+            cp_ms_row = next(
+                (
+                    row["median_ms"]
+                    for row in cp_rows
+                    if row["V"] == V and row["n"] == n and row["r"] == r
+                ),
+                None,
+            )
+            if cp_ms_row is None:
+                continue
+            xs = [int(k) for k in ks_at_ref]
+            ys = [
+                cp_ms_row
+                / target_cached_results[str(reference_L)][str(k)]["median_ms"]
+                for k in ks_at_ref
+            ]
+            ax.plot(xs, ys, marker="o", label=f"n={n}, r={r}")
+        ax.axhline(0.3, color="red", ls="--", lw=1, label="ref 0.3")
+        ax.axhline(1.0, color="orange", ls=":", lw=1, label="parity")
+        ax.set_xscale("log", base=2)
+        ax.set_xlabel(f"k (draft len, cached prefix L={reference_L})")
+        ax.set_ylabel("t_CP / t_cached")
+        ax.set_title(f"V={V}")
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=7)
+
+    fig.suptitle("CP cost vs cached-verification target")
+    fig.tight_layout()
+    fig.savefig(run_dir / "ratio_cached.png", dpi=150)
     plt.close(fig)
 
 
