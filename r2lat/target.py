@@ -80,10 +80,10 @@ def time_target_cached(
       - We prime a DynamicCache once per L by running a single full forward
         over a random prefix of length L.
       - Between timed iterations we restore the cache to its pre-forward
-        state by reassigning `key_cache` / `value_cache` lists to their
-        snapshotted references. The target's forward creates new tensors
-        (torch.cat) rather than mutating in place, so the snapshots stay
-        valid across iterations — no deep copy needed.
+        state by rebuilding it via DynamicCache(ddp_cache_data=base_kv).
+        The constructor calls layer.update() which uses torch.cat to produce
+        fresh tensors, so the base_kv snapshot remains unmodified across
+        iterations — no deep copy needed.
       - `position_ids` and `cache_position` are passed explicitly; Qwen3
         accepts both.
 
@@ -102,20 +102,13 @@ def time_target_cached(
             past_key_values=DynamicCache(),
         )
         prefix_cache = out_prefix.past_key_values
-        # Snapshot the per-layer K/V tensor refs. The forward never mutates
-        # them in place (it uses torch.cat to produce fresh tensors), so
-        # keeping these refs is enough to reset state between iterations.
-        base_keys = list(prefix_cache.key_cache)
-        base_values = list(prefix_cache.value_cache)
+        # Snapshot per-layer K/V tensor refs. Each make_cache() call rebuilds
+        # via ddp_cache_data which uses torch.cat internally, producing fresh
+        # tensors while leaving base_kv untouched across iterations.
+        base_kv = [(layer.keys, layer.values) for layer in prefix_cache.layers]
 
         def make_cache() -> DynamicCache:
-            c = DynamicCache()
-            c.key_cache = list(base_keys)
-            c.value_cache = list(base_values)
-            # HF keeps a token counter on some versions; make sure it agrees.
-            if hasattr(c, "_seen_tokens"):
-                c._seen_tokens = L
-            return c
+            return DynamicCache(ddp_cache_data=base_kv)
 
         for k in draft_ks:
             draft_ids = torch.randint(0, V, (1, k), device=device)
@@ -142,7 +135,7 @@ def time_target_cached(
             results[str(L)][str(k)] = stats
             del draft_ids
 
-        del prefix_cache, out_prefix, base_keys, base_values, prefix_ids
+        del prefix_cache, out_prefix, base_kv, prefix_ids
         torch.cuda.empty_cache()
 
     return results
