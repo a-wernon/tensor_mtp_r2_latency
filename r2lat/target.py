@@ -71,19 +71,21 @@ def time_target_cached(
 ) -> dict[str, dict[str, dict]]:
     """Time a 'verification-style' forward: k query tokens on a cached prefix of length L.
 
-    This approximates what the target actually does in spec-decode verification
-    — process a small batch of draft tokens against an already-populated KV
-    cache. It is almost always MUCH cheaper than a full forward at prefix_len
-    without cache.
+    Measures ONLY the model forward — cache construction is done outside the
+    timed region on each iteration. The earlier version put `make_cache()`
+    inside the timed callable, which meant the timing picked up ~30 ms of
+    DynamicCache rebuild overhead and the resulting numbers were flat in
+    L and k. By constructing the cache in the outer loop and only recording
+    CUDA events around `model(...)`, we now report the true forward cost.
 
     Implementation notes:
-      - We prime a DynamicCache once per L by running a single full forward
-        over a random prefix of length L.
-      - Between timed iterations we restore the cache to its pre-forward
-        state by rebuilding it via DynamicCache(ddp_cache_data=base_kv).
-        The constructor calls layer.update() which uses torch.cat to produce
-        fresh tensors, so the base_kv snapshot remains unmodified across
-        iterations — no deep copy needed.
+      - A full forward over a length-L prefix primes the reference cache
+        and gives us a snapshot `base_kv` of per-layer (K, V) tensor refs.
+        We never mutate these tensors — the model's forward uses torch.cat
+        to produce fresh layer tensors, leaving base_kv intact across iters.
+      - Each iteration builds a fresh DynamicCache via the
+        `ddp_cache_data=base_kv` constructor OUTSIDE the timed window, then
+        CUDA events wrap only the `model(...)` call.
       - `position_ids` and `cache_position` are passed explicitly; Qwen3
         accepts both.
 
@@ -102,12 +104,15 @@ def time_target_cached(
             past_key_values=DynamicCache(),
         )
         prefix_cache = out_prefix.past_key_values
-        # Snapshot per-layer K/V tensor refs. Each make_cache() call rebuilds
-        # via ddp_cache_data which uses torch.cat internally, producing fresh
-        # tensors while leaving base_kv untouched across iterations.
-        base_kv = [(layer.keys, layer.values) for layer in prefix_cache.layers]
+        # Snapshot per-layer K/V tensor refs. Supports both the newer
+        # `.layers` API (each layer holds .keys/.values) and the older
+        # flat-list API (.key_cache / .value_cache).
+        if hasattr(prefix_cache, "layers"):
+            base_kv = [(layer.keys, layer.values) for layer in prefix_cache.layers]
+        else:
+            base_kv = list(zip(prefix_cache.key_cache, prefix_cache.value_cache))
 
-        def make_cache() -> DynamicCache:
+        def build_cache() -> DynamicCache:
             return DynamicCache(ddp_cache_data=base_kv)
 
         for k in draft_ks:
@@ -115,8 +120,10 @@ def time_target_cached(
             pos = torch.arange(L, L + k, device=device).unsqueeze(0)
             cache_pos = torch.arange(L, L + k, device=device)
 
-            def fn() -> None:
-                cache = make_cache()
+            # Warmup — cache construction included here too; we don't care
+            # about absolute warmup time, only that CUDA kernels are warm.
+            for _ in range(warmup):
+                cache = build_cache()
                 _ = model(
                     input_ids=draft_ids,
                     past_key_values=cache,
@@ -124,13 +131,33 @@ def time_target_cached(
                     position_ids=pos,
                     cache_position=cache_pos,
                 )
+            torch.cuda.synchronize()
 
-            logger.info(f"[target-cached] timing L={L} k={k}")
-            times = cuda_time_ms(fn, iters=iters, warmup=warmup)
+            # Timed loop: cache construction outside, CUDA events around the
+            # model forward only.
+            times: list[float] = []
+            for _ in range(iters):
+                cache = build_cache()
+                torch.cuda.synchronize()
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                _ = model(
+                    input_ids=draft_ids,
+                    past_key_values=cache,
+                    use_cache=True,
+                    position_ids=pos,
+                    cache_position=cache_pos,
+                )
+                end.record()
+                end.synchronize()
+                times.append(start.elapsed_time(end))
+
             stats = summary_stats(times)
             logger.info(
-                f"  L={L} k={k}: median={stats['median_ms']:.3f}ms  "
-                f"mean={stats['mean_ms']:.3f}±{stats['stdev_ms']:.3f}ms"
+                f"[target-cached] L={L} k={k}: median={stats['median_ms']:.3f}ms  "
+                f"mean={stats['mean_ms']:.3f}±{stats['stdev_ms']:.3f}ms  "
+                f"min={stats['min_ms']:.3f}ms   (forward only)"
             )
             results[str(L)][str(k)] = stats
             del draft_ids
