@@ -1,16 +1,20 @@
 [project]
-name = "r2-latency"
+name = "factorization-gap"
 version = "0.1.0"
-description = "R2: CP sampling latency microbenchmark (Phase 0 of the CP-joint-drafter extension)."
+description = "R1: Factorization gap in DFlash-style KV-injected diffusion drafters."
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "torch==2.5.1",
     "transformers==4.57.1",
     "accelerate",
     "typing-extensions",
+    "datasets",
     "huggingface-hub",
+    "tensorboard",
     "matplotlib",
     "numpy",
+    "tqdm",
+    "rich",
     "loguru",
     "pyyaml",
 ]

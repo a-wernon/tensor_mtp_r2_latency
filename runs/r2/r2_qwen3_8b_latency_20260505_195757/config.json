@@ -1,0 +1,43 @@
+{
+  "run_name": "r2_qwen3_8b_latency",
+  "target": "Qwen/Qwen3-8B",
+  "device": "cuda",
+  "dtype": "bfloat16",
+  "seed": 42,
+  "seq_lens": [
+    1024,
+    2048,
+    4096
+  ],
+  "hidden_size_override": 4096,
+  "vocabs": [
+    32000,
+    128000,
+    152064
+  ],
+  "block_sizes": [
+    4,
+    8,
+    16,
+    32
+  ],
+  "ranks": [
+    4,
+    8,
+    16,
+    32,
+    64
+  ],
+  "iters": 50,
+  "warmup": 10,
+  "output": {
+    "root": "runs/r2"
+  },
+  "kill_criterion": {
+    "rank_target": 8,
+    "block_size_target": 16,
+    "vocab_target": 152064,
+    "seq_len_target": 2048,
+    "ratio_threshold": 0.3
+  }
+}

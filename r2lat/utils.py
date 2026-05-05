@@ -87,12 +87,12 @@ def cuda_time_ms(fn, iters: int, warmup: int = 10) -> list[float]:
 
 def summary_stats(times: list[float]) -> dict:
     if not times:
-        return {"n": 0}
+        return {"n_samples": 0}
     quantiles = (
         statistics.quantiles(times, n=20) if len(times) >= 20 else None
     )
     return {
-        "n": len(times),
+        "n_samples": len(times),
         "mean_ms": statistics.mean(times),
         "median_ms": statistics.median(times),
         "stdev_ms": statistics.stdev(times) if len(times) > 1 else 0.0,
